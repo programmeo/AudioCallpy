@@ -1,5 +1,7 @@
-Flask==3.0.3
-Flask-SocketIO==5.3.6
-pyaudio==0.2.14
-webrtcvad==2.0.10
-numpy==1.26.4
+flask==2.3.3
+flask-socketio==5.3.6 
+eventlet==0.36.1 
+speechrecognition==3.10.0 
+pydub==0.25.1 
+deep_translator==1.11.1 
+gTTS==2.5.3
