@@ -1,96 +1,82 @@
-from flask import Flask, render_template
+from flask import Flask, render_template, request
 from flask_socketio import SocketIO, emit
-import pyaudio
-import webrtcvad
-import numpy as np
-import threading
-import queue
 import base64
+from translator import transcribe_audio, translate_text, text_to_speech
 
-# Initialize Flask app and SocketIO for WebSocket communication
+# Initialize Flask app
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'secret!'  # Secret key for session security
-socketio = SocketIO(app, cors_allowed_origins="*")  # Enable CORS for WebSocket
+app.config['SECRET_KEY'] = 'your-secret-key'
 
-# Audio configuration
-CHUNK = 1024  # Number of audio frames per buffer
-FORMAT = pyaudio.paInt16  # Audio format (16-bit PCM)
-CHANNELS = 1  # Mono audio
-RATE = 16000  # Sample rate in Hz (suitable for WebRTC VAD)
-VAD = webrtcvad.Vad(3)  # Voice activity detection with aggressive mode (3)
+# Initialize SocketIO with eventlet
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
-# Store connected clients and audio queues
-clients = set()  # Set to track connected client session IDs
-audio_queues = {}  # Dictionary to store audio queues for each client
-vad_status = {}  # Dictionary to track VAD status (speaking or not) for each client
+# Store user language preferences (key: session ID, value: language code)
+user_languages = {}
 
-# Route for the main page
-@app.route('/ws')
+# Route for the homepage
+@app.route('/')
 def index():
-    return render_template('index.html')  # Render the HTML template
+    return render_template('index.html')
 
-# Handle new client connection
+# WebSocket event: Client connects
 @socketio.on('connect')
-def handle_connect():
-    clients.add(request.sid)  # Add client session ID to clients set
-    audio_queues[request.sid] = queue.Queue()  # Create a queue for this client's audio
-    vad_status[request.sid] = False  # Initialize VAD status as not speaking
-    emit('user_count', len(clients), broadcast=True)  # Broadcast current user count to all clients
-    print(f"Client {request.sid} connected")
+def handle_connect(auth=None):
+    print(f'Client connected: {request.sid}')
+    emit('message', {'data': 'Connected to voice chat!'})
 
-# Handle client disconnection
+# WebSocket event: Set user language preference
+@socketio.on('set_language')
+def handle_set_language(data):
+    language = data.get('language', 'en')  # Default to English
+    user_languages[request.sid] = language
+    print(f"Set language for {request.sid} to {language}")
+    emit('message', {'data': f'Language set to {language}'})
+
+# WebSocket event: Receive audio chunk
+@socketio.on('audio_stream')
+def handle_audio_stream(data):
+    try:
+        audio_data = data['audio']
+        sender_sid = request.sid
+        sender_language = user_languages.get(sender_sid, 'en')  # Get sender's language
+
+        # Transcribe audio
+        transcription = transcribe_audio(audio_data)
+        if transcription:
+            print(f"Transcription: {transcription}")
+            # Broadcast transcription to all clients
+            emit('transcription', {'text': transcription}, broadcast=True)
+
+            # Translate and generate TTS for all clients except sender
+            for sid, target_language in user_languages.items():
+                if sid != sender_sid:  # Skip sender
+                    translated = transcription
+                    tts_audio = None
+                    if target_language != 'en' and sender_language != target_language:
+                        # Translate only if sender's language differs from target
+                        translated = translate_text(transcription, target_language)
+                        if translated:
+                            print(f"Translated to {target_language}: {translated}")
+                            # Generate TTS audio for translated text
+                            tts_audio = text_to_speech(translated, target_language)
+                    else:
+                        # Use transcription for English or same language
+                        tts_audio = text_to_speech(transcription, target_language)
+
+                    # Send translation and TTS audio to specific client
+                    emit('translation', {'text': translated, 'language': target_language}, to=sid)
+                    if tts_audio:
+                        print(f"Sending TTS audio to {sid} in {target_language}")
+                        emit('tts_audio', {'audio': tts_audio, 'language': target_language}, to=sid)
+    except Exception as e:
+        print(f"Error processing audio: {e}")
+        emit('error', {'message': 'Failed to process audio'})
+
+# WebSocket event: Client disconnects
 @socketio.on('disconnect')
 def handle_disconnect():
-    clients.remove(request.sid)  # Remove client from clients set
-    del audio_queues[request.sid]  # Remove client's audio queue
-    del vad_status[request.sid]  # Remove client's VAD status
-    emit('user_count', len(clients), broadcast=True)  # Broadcast updated user count
-    print(f"Client {request.sid} disconnected")
+    print(f'Client disconnected: {request.sid}')
+    user_languages.pop(request.sid, None)
 
-# Handle start audio request from client
-@socketio.on('start_audio')
-def start_audio():
-    client_id = request.sid  # Get the client's session ID
-    print(f"Starting audio for client {client_id}")
-
-    # Function to capture and process audio
-    def audio_pipeline():
-        p = pyaudio.PyAudio()  # Initialize PyAudio
-        stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)  # Open audio input stream
-        
-        try:
-            while client_id in clients:  # Continue while client is connected
-                data = stream.read(CHUNK, exception_on_overflow=False)  # Read audio chunk
-                audio_queues[client_id].put(data)  # Put audio data in client's queue
-                
-                # Voice activity detection
-                frame = np.frombuffer(data, dtype=np.int16)  # Convert audio to numpy array
-                is_speech = VAD.is_speech(data, RATE)  # Check if the audio contains speech
-                
-                # Update VAD status if changed
-                if vad_status[client_id] != is_speech:
-                    vad_status[client_id] = is_speech
-                    socketio.emit('vad_status', {'speaking': is_speech}, to=client_id)  # Send VAD status to client
-                
-                # Broadcast audio to all other clients
-                encoded_data = base64.b64encode(data).decode('utf-8')  # Encode audio to base64 for transmission
-                socketio.emit('audio_stream', encoded_data, skip_sid=client_id)  # Send audio to all except sender
-        
-        except Exception as e:
-            print(f"Error in audio pipeline for {client_id}: {e}")
-        finally:
-            stream.stop_stream()  # Stop the audio stream
-            stream.close()  # Close the stream
-            p.terminate()  # Terminate PyAudio
-
-    # Start audio pipeline in a separate thread
-    threading.Thread(target=audio_pipeline, daemon=True).start()
-
-# Handle stop audio request from client
-@socketio.on('stop_audio')
-def stop_audio():
-    print(f"Stopping audio for client {request.sid}")
-
-# Run the Flask app with SocketIO
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=3000, debug=True)
+    socketio.run(app, debug=True, host='0.0.0.0', port=5000, use_reloader=False)
