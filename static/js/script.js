@@ -13,22 +13,25 @@ async function startRecording() {
 
         mediaRecorder.ondataavailable = (event) => {
             if (event.data.size > 0) {
-                audioChunks.push(event.data);
+                // Send audio chunk immediately for real-time streaming
                 const reader = new FileReader();
                 reader.onload = () => {
                     const base64Audio = reader.result.split(',')[1];
                     socket.emit('audio_stream', { audio: base64Audio });
                 };
                 reader.readAsDataURL(event.data);
+                // Store chunk for potential later use (e.g., saving full audio)
+                audioChunks.push(event.data);
             }
         };
 
         mediaRecorder.onstop = () => {
             console.log('Recording stopped');
-            audioChunks = [];
+            audioChunks = []; // Clear chunks
+            logMessage('Stopped recording');
         };
 
-        mediaRecorder.start(100);
+        mediaRecorder.start(100); // Capture and send chunks every 100ms
         console.log('Recording started');
         logMessage('Started recording');
     } catch (err) {
@@ -41,7 +44,6 @@ async function startRecording() {
 function stopRecording() {
     if (mediaRecorder && mediaRecorder.state !== 'inactive') {
         mediaRecorder.stop();
-        logMessage('Stopped recording');
     }
 }
 
