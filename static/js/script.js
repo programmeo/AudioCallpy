@@ -1,64 +1,112 @@
-// Connect to the Socket.IO server
+// Connect to SocketIO server
 const socket = io();
 
-// Get DOM elements
-const startButton = document.getElementById('start-audio');
-const stopButton = document.getElementById('stop-audio');
-const userCount = document.getElementById('user-count');
-const vadStatus = document.getElementById('vad-status');
+// Variables for audio recording
+let mediaRecorder = null;
+let audioChunks = [];
 
-// Initialize Web Audio API
-const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+// Request microphone access and start recording
+async function startRecording() {
+    try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
 
-// Handle start audio button click
-startButton.addEventListener('click', () => {
-    socket.emit('start_audio'); // Send start audio signal to server
-    startButton.disabled = true; // Disable start button
-    stopButton.disabled = false; // Enable stop button
-});
+        mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0) {
+                audioChunks.push(event.data);
+                const reader = new FileReader();
+                reader.onload = () => {
+                    const base64Audio = reader.result.split(',')[1];
+                    socket.emit('audio_stream', { audio: base64Audio });
+                };
+                reader.readAsDataURL(event.data);
+            }
+        };
 
-// Handle stop audio button click
-stopButton.addEventListener('click', () => {
-    socket.emit('stop_audio'); // Send stop audio signal to server
-    startButton.disabled = false; // Enable start button
-    stopButton.disabled = true; // Disable stop button
-    vadStatus.textContent = ''; // Clear speaking status
-});
+        mediaRecorder.onstop = () => {
+            console.log('Recording stopped');
+            audioChunks = [];
+        };
 
-// Update user count when received from server
-socket.on('user_count', (count) => {
-    userCount.textContent = count; // Display number of connected users
-});
+        mediaRecorder.start(100);
+        console.log('Recording started');
+        logMessage('Started recording');
+    } catch (err) {
+        console.error('Error accessing microphone:', err);
+        logMessage('Error: Could not access microphone');
+    }
+}
 
-// Update VAD status when received from server
-socket.on('vad_status', (data) => {
-    vadStatus.textContent = data.speaking ? 'Speaking...' : ''; // Show "Speaking..." if speaking
+// Stop recording
+function stopRecording() {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        mediaRecorder.stop();
+        logMessage('Stopped recording');
+    }
+}
+
+// Set language preference
+function setLanguage() {
+    const language = document.getElementById('language').value;
+    socket.emit('set_language', { language: language });
+    logMessage(`Selected language: ${language}`);
+}
+
+// Log messages to the chat div
+function logMessage(message) {
+    const chat = document.getElementById('chat');
+    const p = document.createElement('p');
+    p.textContent = message;
+    chat.appendChild(p);
+    chat.scrollTop = chat.scrollHeight;
+}
+
+// Handle connection
+socket.on('connect', () => {
+    console.log('Connected to server');
+    logMessage('Connected to voice chat');
+    setLanguage();
 });
 
 // Handle incoming audio stream
-socket.on('audio_stream', (encodedData) => {
-    // Decode base64 audio data
-    const audioData = atob(encodedData);
-    const arrayBuffer = new ArrayBuffer(audioData.length);
-    const view = new Uint8Array(arrayBuffer);
-    for (let i = 0; i < audioData.length; i++) {
-        view[i] = audioData.charCodeAt(i);
+socket.on('audio_stream', (data) => {
+    try {
+        const audioBlob = new Blob([Uint8Array.from(atob(data.audio), c => c.charCodeAt(0))], { type: 'audio/webm' });
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audio = new Audio(audioUrl);
+        audio.play();
+        logMessage('Received and playing original audio');
+    } catch (err) {
+        console.error('Error playing audio:', err);
+        logMessage('Error: Failed to play audio');
     }
-    
-    // Convert to Float32Array for Web Audio API
-    const floatArray = new Float32Array(arrayBuffer.byteLength / 2);
-    const int16Array = new Int16Array(arrayBuffer);
-    for (let i = 0; i < int16Array.length; i++) {
-        floatArray[i] = int16Array[i] / 32768.0; // Convert 16-bit PCM to float
+});
+
+// Handle transcription
+socket.on('transcription', (data) => {
+    logMessage(`Transcription: ${data.text}`);
+});
+
+// Handle translation
+socket.on('translation', (data) => {
+    logMessage(`Translated (${data.language}): ${data.text}`);
+});
+
+// Handle TTS audio
+socket.on('tts_audio', (data) => {
+    try {
+        const audioBlob = new Blob([Uint8Array.from(atob(data.audio), c => c.charCodeAt(0))], { type: 'audio/mp3' });
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audio = new Audio(audioUrl);
+        audio.play();
+        logMessage(`Playing TTS audio in ${data.language}`);
+    } catch (err) {
+        console.error('Error playing TTS audio:', err);
+        logMessage('Error: Failed to play TTS audio');
     }
-    
-    // Create audio buffer
-    const audioBuffer = audioContext.createBuffer(1, floatArray.length, 16000);
-    audioBuffer.copyToChannel(floatArray, 0);
-    
-    // Play audio
-    const source = audioContext.createBufferSource();
-    source.buffer = audioBuffer;
-    source.connect(audioContext.destination);
-    source.start();
+});
+
+// Handle errors from server
+socket.on('error', (data) => {
+    logMessage(`Error: ${data.message}`);
 });
